@@ -1,0 +1,5 @@
+logs*
+output_power_specs*
+*__pycache__*
+*.pyc
+*.ipynb_checkpoints
