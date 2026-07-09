@@ -5,9 +5,9 @@ This repository contains the API based on QCoDeS to operate the QphoX Optical Co
  
  
 ## Installation
-- Clone the repository and navigate to the ```qx_ocs``` folder
-- Double click on ```create_qphoxvenv.bat``` to initialise the conda virtual environment
-- Follow sections 2.2 and 3.1 of the Application Note to use the software
+- Clone the repository and navigate to the ```qx_ocs``` folder.
+- Double click on ```create_qphoxvenv.bat``` to initialise the conda virtual environment.
+- Follow sections 2.2 and 3.1 of the Application Note to use the software.
  
 ## Library Usage
 The OpticalControlSystem class is accessed via an IP address and can be operated using parameters and functions explained below.

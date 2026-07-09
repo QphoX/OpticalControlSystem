@@ -11,12 +11,16 @@ import threading
 import time
 
 import csv
-import stat
 
 try:
     from .qx_ocs_core.PDC_main import Labphox_PDC
 except ImportError:
     from qx_ocs_core.PDC_main import Labphox_PDC
+
+
+_PACKAGE_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+_PRIMARY_LOG_DIR = os.path.join(_PACKAGE_DIR, "logs")
+_LOG_BUFFER_MAX = 2880
     
 
 class OpticalControlSystemInstrument(qcodes.Instrument):
@@ -25,7 +29,16 @@ class OpticalControlSystemInstrument(qcodes.Instrument):
         super().__init__(name, **kwargs)
 
         self.debug = debug
-        
+
+        self.__closed = False
+        self.__log_interval = 30
+        self.__stop_logging = None
+        self.__logger_thread = None
+        self.__log_directory = None
+        self.__log_header = None
+        self.__log_buffer = []
+        self.__log_locked = False
+
         self.__pdc = Labphox_PDC(IP=address, debug=debug)
         self.__pdc.connect()
 
@@ -70,47 +83,58 @@ class OpticalControlSystemInstrument(qcodes.Instrument):
         self.__initialize_logger()
 
     def __del__(self):
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def close(self):
-        print(f"OpticalControlSystem '{self.name}' | Closing device {self.IP.get()}")
+        if self.__closed:
+            return
+        self.__closed = True
 
-        # Signal the thread to stop
-        self.__stop_logging.set()
-        self.__logger_thread.join()
-        print(f"OpticalControlSystem '{self.name}' | Logging stopped and file saved.")
-        
-        self.output_switch.set(0)
-        time.sleep(0.5)
-        print(f"OpticalControlSystem '{self.name}' | Output switch: {self.output_switch.get()}")
+        if self.__stop_logging is not None:
+            self.__stop_logging.set()
+        if self.__logger_thread is not None and self.__logger_thread.is_alive():
+            self.__logger_thread.join(timeout=self.__log_interval)
+            print(f"OpticalControlSystem '{self.name}' | Logging stopped and file saved.")
 
-        self.laser_output.set('off')
-        time.sleep(0.5)
-        print(f"OpticalControlSystem '{self.name}' | Laser output: {self.laser_output.get()}")
+        try:
+            print(f"OpticalControlSystem '{self.name}' | Closing device {self.IP.get()}")
 
-        self.laser_switch.set('internal')
-        time.sleep(0.5)
-        print(f"OpticalControlSystem '{self.name}' | Laser switch: {self.laser_switch.get()}")
+            self.output_switch.set(0)
+            time.sleep(0.5)
+            print(f"OpticalControlSystem '{self.name}' | Output switch: {self.output_switch.get()}")
 
-        self.__pdc.set_VOA1_mode('man')
-        self.__pdc.set_VOA1_att(0)
+            self.laser_output.set('off')
+            time.sleep(0.5)
+            print(f"OpticalControlSystem '{self.name}' | Laser output: {self.laser_output.get()}")
 
-        self.laser_attenuation.set(0)
-        time.sleep(0.5)
-        print(f"OpticalControlSystem '{self.name}' | Laser attenuation: {self.laser_attenuation.get()} dB")
+            self.laser_switch.set('internal')
+            time.sleep(0.5)
+            print(f"OpticalControlSystem '{self.name}' | Laser switch: {self.laser_switch.get()}")
 
-        print(f"OpticalControlSystem '{self.name}' | EOM voltage: {self.eom_voltage.get():.2e} V")
+            self.__pdc.set_VOA1_mode('man')
+            self.__pdc.set_VOA1_att(0)
 
-        print(f"OpticalControlSystem '{self.name}' | Attenuator power: {self.attenuator_power.get():.2e} W")
+            self.laser_attenuation.set(0)
+            time.sleep(0.5)
+            print(f"OpticalControlSystem '{self.name}' | Laser attenuation: {self.laser_attenuation.get()} dB")
 
-        print(f"OpticalControlSystem '{self.name}' | Modulator power: {self.modulator_power.get():.2e} W")
+            print(f"OpticalControlSystem '{self.name}' | EOM voltage: {self.eom_voltage.get():.2e} V")
 
-        print(f"OpticalControlSystem '{self.name}' | Output power: {self.output_power.get():.2e} W")
+            print(f"OpticalControlSystem '{self.name}' | Attenuator power: {self.attenuator_power.get():.2e} W")
 
-        if self.debug:
-            print(f"OpticalControlSystem '{self.name}' | Parameter snapshot")
-            print(self.print_readable_snapshot())
-            
+            print(f"OpticalControlSystem '{self.name}' | Modulator power: {self.modulator_power.get():.2e} W")
+
+            print(f"OpticalControlSystem '{self.name}' | Output power: {self.output_power.get():.2e} W")
+
+            if self.debug:
+                print(f"OpticalControlSystem '{self.name}' | Parameter snapshot")
+                print(self.print_readable_snapshot())
+        except Exception as e:
+            print(f"OpticalControlSystem '{self.name}' | Warning: hardware shutdown incomplete: {e}")
+
         super().close()
 
     def set_IP(self, value):
@@ -223,6 +247,25 @@ class OpticalControlSystemInstrument(qcodes.Instrument):
             print(f"OpticalControlSystem '{self.name}' | Parameter snapshot")
             print(self.print_readable_snapshot())
 
+    def __resolve_qx_ocs_subdir(self, subfolder):
+        candidates = [os.path.join(_PACKAGE_DIR, subfolder)]
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if local_appdata:
+            candidates.append(os.path.join(local_appdata, "qx_ocs", subfolder))
+
+        for path in candidates:
+            try:
+                os.makedirs(path, exist_ok=True)
+                probe = os.path.join(path, ".write_test")
+                with open(probe, "w") as f:
+                    f.write("ok")
+                os.remove(probe)
+                return os.path.abspath(path)
+            except OSError as e:
+                print(f"OpticalControlSystem '{self.name}' | Output location '{path}' "
+                      f"not usable ({e}); trying next.")
+        return None
+
     def plot_power_specs(self, result_dict, power_prefix):
         import numpy as np
         import matplotlib.pyplot as plt
@@ -230,8 +273,14 @@ class OpticalControlSystemInstrument(qcodes.Instrument):
         import os
         import json
         
-        save_folder = 'output_power_specs/' + power_prefix
-        save_prefix = save_folder + '/' + power_prefix + '_'
+        base_dir = self.__resolve_qx_ocs_subdir('output_power_specs')
+        if base_dir is None:
+            print(f"OpticalControlSystem '{self.name}' | WARNING: no writable output "
+                  f"location (tried qx_ocs/output_power_specs and %LOCALAPPDATA%). "
+                  f"Power specs not saved.")
+            return
+        save_folder = os.path.join(base_dir, power_prefix)
+        save_prefix = os.path.join(save_folder, power_prefix + '_')
         os.makedirs(save_folder, exist_ok=True)
         
         timestamps_s = result_dict['timestamps_s']
@@ -335,6 +384,19 @@ class OpticalControlSystemInstrument(qcodes.Instrument):
     def __initialize_logger(self):
         self.__log_interval = 30  # in seconds
         self.__stop_logging = threading.Event()
+        self.__log_header = None
+        self.__log_buffer = []
+        self.__log_locked = False
+
+        self.__log_directory = self.__resolve_qx_ocs_subdir("logs")
+        if self.__log_directory is None:
+            print(f"OpticalControlSystem '{self.name}' | WARNING: no writable log "
+                  f"location (tried qx_ocs/logs and %LOCALAPPDATA%). Logging is "
+                  f"DISABLED for this session.")
+            return
+
+        self.__write_log_pointer()
+        print(f"OpticalControlSystem '{self.name}' | Logging to: {self.__log_directory}")
 
         # Start background logger thread
         self.__logger_thread = threading.Thread(target=self.__log_loop, daemon=True)
@@ -342,48 +404,90 @@ class OpticalControlSystemInstrument(qcodes.Instrument):
         if self.debug:
             print(f"OpticalControlSystem '{self.name}' | Logging started every {self.__log_interval} seconds.")
 
+    def __write_log_pointer(self):
+        message = (
+            "Optical Control System logs for this machine are written to:\n"
+            f"{self.__log_directory}\n"
+        )
+        self.__write_pointer_file(self.__log_directory, message, warn=True)
+        if _PRIMARY_LOG_DIR != self.__log_directory:
+            self.__write_pointer_file(_PRIMARY_LOG_DIR, message, warn=False)
+
+    def __write_pointer_file(self, directory, message, warn):
+        try:
+            os.makedirs(directory, exist_ok=True)
+            with open(os.path.join(directory, "QX_OCS_WHERE_ARE_MY_LOGS.txt"), "w") as f:
+                f.write(message)
+        except OSError as e:
+            if warn:
+                print(f"OpticalControlSystem '{self.name}' | Could not write log "
+                      f"pointer to '{directory}': {e}")
+
     def __log_loop(self):
         while not self.__stop_logging.is_set():
-            self.__save_snapshot_to_readonly_logs()
-            time.sleep(self.__log_interval)
+            self.__log_tick()
+            self.__stop_logging.wait(self.__log_interval)
+        self.__flush_log_buffer(final=True)
+
+    def __log_tick(self):
+        try:
+            header, row = self.__build_log_row()
+            self.__log_header = header
+            self.__log_buffer.append(row)
+            if len(self.__log_buffer) > _LOG_BUFFER_MAX:
+                dropped = len(self.__log_buffer) - _LOG_BUFFER_MAX
+                del self.__log_buffer[:dropped]
+                print(f"OpticalControlSystem '{self.name}' | WARNING: log buffer "
+                      f"full; dropped {dropped} oldest row(s).")
+        except Exception as e:
+            print(f"OpticalControlSystem '{self.name}' | WARNING: could not build "
+                  f"log row (skipped): {e}")
+            return
+        self.__flush_log_buffer()
+
+    def __build_log_row(self):
+        snapshot = self.snapshot()
+        time_str = datetime.now().strftime('%H:%M:%S')
+        param_names = [p for p in snapshot['parameters'] if p.upper() != 'IDN']
+        row = [time_str] + [snapshot['parameters'][p].get('value', '<missing>')
+                            for p in param_names]
+        return ['Time'] + param_names, row
+
+    def __flush_log_buffer(self, final=False):
+        if self.__log_directory is None or not self.__log_buffer:
+            return
+
+        filename = os.path.join(self.__log_directory, self.__get_filename())
+        try:
+            file_exists = os.path.exists(filename)
+            with open(filename, 'a', newline='') as f:
+                writer = csv.writer(f)
+                if not file_exists and self.__log_header is not None:
+                    writer.writerow(self.__log_header)
+                writer.writerows(self.__log_buffer)
+            written = len(self.__log_buffer)
+            self.__log_buffer = []
+            if self.__log_locked:
+                self.__log_locked = False
+                print(f"OpticalControlSystem '{self.name}' | Logging resumed "
+                      f"({written} buffered entr{'y' if written == 1 else 'ies'} written).")
+        except OSError as e:
+            if getattr(e, 'winerror', None) in (32, 33):
+                if not self.__log_locked:
+                    self.__log_locked = True
+                    print(f"OpticalControlSystem '{self.name}' | Log can not be "
+                          f"updated as it is open in another application; entries "
+                          f"are buffered and will be written when you close it.")
+            elif not final:
+                print(f"OpticalControlSystem '{self.name}' | WARNING: log write "
+                      f"failed (buffered, will retry): {e}")
+        except Exception as e:
+            if not final:
+                print(f"OpticalControlSystem '{self.name}' | WARNING: log write "
+                      f"failed (buffered, will retry): {e}")
 
     def __get_filename(self):
         """Generate a unique filename for this instrument per day."""
         # Get current date in yyyy_mm_dd format
         date_str = datetime.now().strftime('%Y_%m_%d')
         return f"{date_str}_logs_{self.name}.csv"
-
-    def __save_snapshot_to_readonly_logs(self):
-        logs_folder = "logs"
-        if not os.path.exists(logs_folder):
-            os.makedirs(logs_folder)
-
-        filename = os.path.join(logs_folder, self.__get_filename())
-        snapshot = self.snapshot()
-        time_str = datetime.now().strftime('%H:%M:%S')
-
-        # Extract parameter names and values from snapshot, excluding IDN
-        param_names = [
-            param for param in snapshot['parameters']
-            if param.upper() != 'IDN'
-        ]
-        row = [time_str]
-        for param in param_names:
-            value = snapshot['parameters'][param].get('value', '<missing>')
-            row.append(value)
-
-        file_exists = os.path.exists(filename)
-
-        if file_exists:
-            os.chmod(filename, stat.S_IWRITE)
-
-        with open(filename, 'a', newline='') as f:
-            writer = csv.writer(f)
-            if not file_exists:
-                writer.writerow(['Time'] + param_names)
-            writer.writerow(row)
-
-        os.chmod(filename, stat.S_IREAD)
-
-        if self.debug:
-            print(f"Snapshot appended to {filename} (now read-only)")
